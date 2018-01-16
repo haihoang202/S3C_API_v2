@@ -1,5 +1,6 @@
 <?php
 
+
 namespace App\Http\Controllers;
 
 use Couchbase\Document;
@@ -14,6 +15,8 @@ use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Storage;
 use App\Documents;
 use GuzzleHttp\Client;
+use Aws\S3\S3Client;
+
 
 class S3Controller extends Controller
 {
@@ -46,9 +49,32 @@ class S3Controller extends Controller
         $file_to_decrypt = $data['file_to_decrypt'];
         $user_repo = $user->id;
 
-        $document = Documents::where(['user_id'=>$user_repo,'name'=>$file_to_decrypt])->get();
+        $document = Documents::where(['user_id'=>$user_repo,'id_name'=>$file_to_decrypt])->get();
 
         $path = storage_path("app/{$user_repo}/{$document[0]->id_name}");
+
+        $s3_access_key = $data['s3_access_key'];
+        $s3_secret_key = $data['s3_secret_key'];
+        $s3_bucket = $data['s3_bucket'];
+        $s3_region_name = $data['s3_region_name'];
+        $s3_key = $data['s3_key'];
+
+        $s3 = new \Aws\S3\S3Client([
+            'version'     => 'latest',
+            'region'      => $s3_region_name,
+            'credentials' => [
+                'key'    => $s3_access_key,
+                'secret' => $s3_secret_key,
+            ],
+        ]);
+
+        $result = $s3->getObject(array(
+            'Bucket' => $s3_bucket,
+            'Key'    => $s3_key."/".$file_to_decrypt,
+            'Delimiter'=>'/',
+            'SaveAs' => $path,
+        ));
+
         $configPath = storage_path("app/{$user_repo}/config.properties");
 
         $cmd = "java -jar S3Client.jar -d {$path} {$configPath}";
@@ -59,7 +85,7 @@ class S3Controller extends Controller
 
     }
 
-    public function edit() {
+    public function edit(Request $request) {
         $user = Auth::user();
 
     }
@@ -70,16 +96,49 @@ class S3Controller extends Controller
         $file_to_remove = $data['file_to_remove'];
         $user_repo = $user->id;
 
+        //Remove in database
         $document = Documents::where(['user_id'=>$user_repo,'id_name'=>$file_to_remove])->delete();
 
-        $path_temp = public_path('upload');
+        $path_temp = storage_path("app/{$user_repo}/{$file_to_remove}");
         $configPath = storage_path("app/{$user_repo}/config.properties");
 
-        $cmd = "java -jar S3Client.jar -u {$path_temp} {$configPath}";
-
+        //Remove from S3 Index and DocSize
+        $cmd = "java -jar S3Client.jar -r {$path_temp} {$configPath}";
         exec($cmd, $output, $return);
 
-        return response()->json(['result'=>"Deleted file {$file_to_remove}"]);
+        //Remove from API storage
+        $file_root = str_replace("txt","",$file_to_remove);
+        $cmd = "rm -rf {$file_root}.*";
+        exec($cmd, $output, $return);
+
+        $s3_access_key = $data['s3_access_key'];
+        $s3_secret_key = $data['s3_secret_key'];
+        $s3_bucket = $data['s3_bucket'];
+        $s3_region_name = $data['s3_region_name'];
+        $s3_key = $data['s3_key'];
+
+        $s3 = new \Aws\S3\S3Client([
+            'version'     => 'latest',
+            'region'      => $s3_region_name,
+            'credentials' => [
+                'key'    => $s3_access_key,
+                'secret' => $s3_secret_key,
+            ],
+        ]);
+
+        $result = $s3->deleteObject(array(
+            'Bucket' => $s3_bucket,
+            'Key'    => $s3_key."/".$file_to_remove,
+            'Delimiter'=>'/',
+        ));
+
+        $result .= $s3->deleteObject(array(
+            'Bucket' => $s3_bucket,
+            'Key'    => $s3_key."/".str_replace('.txt','.key',$file_to_remove),
+            'Delimiter'=>'/',
+        ));
+
+        return response()->json(['result'=>"Deleted file {$file_to_remove}", 'query result'=>$result]);
 
     }
 
@@ -104,72 +163,60 @@ class S3Controller extends Controller
     }
 
     public function upload(Request $request) {
-//        $user = Auth::user();
-//
-//        $user_repo = $user->id;
-//
-//        $filename = $request->file('file')->getClientOriginalName();
-//
-//        $file = $request->file('file')->store($user_repo);
-//
-//
-//        $path = storage_path("app/{$file}");
-//        $path_temp = public_path('upload');
-//        $configPath = storage_path("app/{$user_repo}/config.properties");
-//        $user_path = storage_path("app/{$user_repo}");
-//
-//        $name = str_replace_first("{$user_repo}/","",$file);
-//
-//        $file_record = Documents::create([
-//            'name' => $filename,
-//            'user_id' => $user_repo,
-//            'path' => $path,
-//            'id_name' => $name,
-//        ]);
-//
-//        $cmd = "cp {$path} {$path_temp}";
-//
-//        exec($cmd, $output, $return);
-//
-//        $cmd = "java -jar S3Client.jar -u {$path_temp} {$configPath}";
-//
-////        dd($cmd);
-//
-//        exec($cmd, $output, $return);
-//
-//        $cmd = "mv {$path_temp}/*.* {$user_path}";
-//
-//        exec($cmd, $output1, $return);
-//
-////        return response()->json(['result'=>$output,'name'=>$file_record['name'],'created_at'=>$file_record['created_at']],200);
-//        return response()->json(['result'=>$output,'success'=>$file_record],200);
-
-
+        //Authenticate user
         $user = Auth::user();
-        $data = $request->all();
-        $filename = $data['filename'];
-        $s3_access_key = $data['s3_access_key'];
-//        $s3_secret_key = $data['s3_secret_key'];
-        $s3_service = $data['s3_service'];
-        $s3_region_name = $data['s3_region_name'];
 
-        $host = $s3_service . "s3.amazonaws.com";
+        $user_repo = $user->id;
+        $filename = $request->file('file')->getClientOriginalName();
+        $file = $request->file('file')->store($user_repo);
 
-        $client = new Client([
-           'base_uri' => $host,
-            'timeout' => 2.0,
+        $path = storage_path("app/{$file}");
+        $path_temp = public_path('upload');
+        $configPath = storage_path("app/{$user_repo}/config.properties");
+        $user_path = storage_path("app/{$user_repo}");
+
+        $name = str_replace_first("{$user_repo}/","",$file);
+
+        //Create record in the database
+        $file_record = Documents::create([
+            'name' => $filename,
+            'user_id' => $user_repo,
+            'path' => $path,
+            'id_name' => $name,
         ]);
 
-        $date = date("Y-m-d h:i:s");
-        $cmd = "python signature.py -k {$s3_access_key} -d \"{$date}\" -r {$s3_region_name} -s {$s3_service}";
+        //Copy file from user repo to upload folder for processing
+        $cmd = "cp {$path} {$path_temp}";
+        exec($cmd, $output, $return);
+        $cmd = "java -jar S3Client.jar -u {$path_temp} {$configPath}";
         exec($cmd, $output, $return);
 
-//        print($output);
-//        dd($cmd);
+        //Transfer data to user's S3 bucket
+        $data = $request->all();
+        $s3_access_key = $data['s3_access_key'];
+        $s3_secret_key = $data['s3_secret_key'];
+        $s3_bucket = $data['s3_bucket'];
+        $s3_region_name = $data['s3_region_name'];
 
-        $response = $client->request("PUT","/{$filename}", ['auth' => "{$output}"]);
+        $s3 = new \Aws\S3\S3Client([
+            'version'     => 'latest',
+            'region'      => $s3_region_name,
+            'credentials' => [
+                'key'    => $s3_access_key,
+                'secret' => $s3_secret_key,
+            ],
+        ]);
 
+        $dest = 's3://'.$s3_bucket;
+        $manager = new \Aws\S3\Transfer($s3, $path_temp, $dest);
 
+        $manager->transfer();
+
+        $cmd = "mv {$path_temp}/*.* {$user_path}";
+
+        exec($cmd, $output1, $return);
+        return response()->json(['result'=>'Done'],200);
+//        return response()->download($path);
     }
 
 }
